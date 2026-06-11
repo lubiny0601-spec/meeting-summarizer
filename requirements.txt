@@ -1,9 +1,7 @@
-streamlit>=1.36.0
-funasr
-modelscope
---extra-index-url https://download.pytorch.org/whl/cpu
-torch
-torchaudio
-soundfile
 google-genai
 python-dotenv
+sounddevice
+soundfile
+PySide6
+keyboard
+markdown

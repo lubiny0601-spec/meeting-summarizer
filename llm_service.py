@@ -1,107 +1,69 @@
 import logging
 from google import genai
 import config
+import re
+import time
 
 logger = logging.getLogger(__name__)
 
 class LLMService:
-    def __init__(self, api_key: str = None):
-        """
-        初始化 Gemini API 客户端。
-        优先使用传入的 api_key，如果没有则使用 config 中加载的配置。
-        """
+    def __init__(self, api_key: str = None, model_name: str = None):
         key = api_key or config.GEMINI_API_KEY
+        self.model_name = model_name or config.GEMINI_MODEL_NAME
         if key:
             self.client = genai.Client(api_key=key)
         else:
             self.client = None
 
     def update_api_key(self, api_key: str):
-        """在运行时更新 API Key"""
         self.client = genai.Client(api_key=api_key)
 
-    def chunk_text(self, text: str, max_chars: int) -> list[str]:
-        """
-        按照最大字符数将长文本切分为块，尽量以说话人段落为边界。
-        """
-        chunks = []
-        current_chunk = ""
-        # 按照段落（说话人变更）分割
-        lines = text.split('\n\n')
-        
-        for line in lines:
-            if not line.strip():
-                continue
-                
-            if len(current_chunk) + len(line) > max_chars:
-                if current_chunk:
-                    chunks.append(current_chunk)
-                current_chunk = line
-            else:
-                current_chunk += ("\n\n" + line) if current_chunk else line
-        
-        if current_chunk:
-            chunks.append(current_chunk)
-            
-        return chunks
-
-    def generate_summary(self, transcript: str, progress_callback=None) -> str:
-        """
-        基于会议逐字稿生成摘要。包含分块 Map-Reduce 逻辑。
-        """
+    def process_audio_to_summary(self, audio_path: str, style_name: str, progress_callback=None) -> tuple[str, str]:
         if not self.client:
-            raise ValueError("未配置 Gemini API Key，请先配置！")
-        
-        if not transcript.strip():
-            return "未检测到有效语音内容。"
+            raise ValueError("请先配置 Gemini API Key")
 
-        # 分块
-        chunks = self.chunk_text(transcript, config.CHUNK_MAX_CHARS)
-        
-        # 单块情况：无需 Map-Reduce
-        if len(chunks) == 1:
-            if progress_callback:
-                progress_callback("逐字稿较短，正在直接生成最终会议纪要...")
-            prompt = config.REDUCE_PROMPT_TEMPLATE.replace("{text}", chunks[0])
-            
-            response = self.client.models.generate_content(
-                model=config.GEMINI_MODEL_NAME,
-                contents=prompt,
-            )
-            return response.text
+        style_prompt = config.STYLES.get(style_name, config.STYLES.get("详细长篇纪要 (Detailed)"))
+        prompt = config.MULTIMODAL_PROMPT.replace("{style_prompt}", style_prompt)
 
-        # 多块情况：Map-Reduce
-        chunk_summaries = []
-        total_chunks = len(chunks)
-        
-        for i, chunk in enumerate(chunks):
-            if progress_callback:
-                progress_callback(f"由于文本较长，正在分段分析：处理第 {i+1}/{total_chunks} 部分...")
-            
-            prompt = config.MAP_PROMPT_TEMPLATE.replace("{text}", chunk)
-            try:
-                response = self.client.models.generate_content(
-                    model=config.GEMINI_MODEL_NAME,
-                    contents=prompt,
-                )
-                chunk_summaries.append(response.text)
-            except Exception as e:
-                logger.error(f"分析第 {i+1} 块时出错: {str(e)}")
-                chunk_summaries.append(f"【分块 {i+1} 分析失败】")
-        
-        if progress_callback:
-            progress_callback("正在整合所有分段结果，生成最终会议纪要...")
-            
-        # Reduce
-        combined_text = "\n\n---\n\n".join(chunk_summaries)
-        reduce_prompt = config.REDUCE_PROMPT_TEMPLATE.replace("{text}", combined_text)
-        
         try:
-            final_response = self.client.models.generate_content(
-                model=config.GEMINI_MODEL_NAME,
-                contents=reduce_prompt,
+            if progress_callback:
+                progress_callback("正在将音频加密上传至云端大脑...")
+            
+            # 使用 File API 上传音频文件
+            audio_file = self.client.files.upload(file=audio_path)
+            
+            if progress_callback:
+                progress_callback("正在让 AI 聆听并解析音频内容...")
+            
+            # 给 Google 后台一点点时间初始化文件状态
+            time.sleep(2) 
+
+            if progress_callback:
+                progress_callback(f"AI 正在同时执行听写与【{style_name}】生成，请稍候...")
+                
+            response = self.client.models.generate_content(
+                model=self.model_name,
+                contents=[audio_file, prompt]
             )
-            return final_response.text
+            
+            text = response.text
+            
+            # 解析 XML tag
+            transcript_match = re.search(r'<Transcript>(.*?)</Transcript>', text, re.DOTALL | re.IGNORECASE)
+            summary_match = re.search(r'<Summary>(.*?)</Summary>', text, re.DOTALL | re.IGNORECASE)
+            
+            transcript = transcript_match.group(1).strip() if transcript_match else "未提取到规范的逐字稿格式内容，原始返回如下：\n\n" + text
+            summary = summary_match.group(1).strip() if summary_match else "未提取到规范的总结格式内容，请参考逐字稿框内的原始返回。"
+
+            # 隐私保护：处理完毕后立即删除云端文件
+            try:
+                self.client.files.delete(name=audio_file.name)
+                if progress_callback:
+                    progress_callback("云端临时音频已安全销毁。处理完成！")
+            except Exception as e:
+                logger.warning(f"Failed to delete remote file {audio_file.name}: {e}")
+
+            return transcript, summary
+
         except Exception as e:
-            logger.error(f"最终整合出错: {str(e)}")
-            return f"生成最终摘要时发生错误: {str(e)}\n\n以下是部分总结内容：\n{combined_text}"
+            return f"发生错误: {str(e)}", f"处理失败: {str(e)}"
